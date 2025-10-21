@@ -1,0 +1,280 @@
+# NHL SOG Prediction System - Configuration
+
+# Data Sources
+data:
+  collection_start_date: "2024-10-01"
+  
+  nhl_api:
+    base_url: "https://api-web.nhle.com/v1"
+    rate_limit_seconds: 1.0
+    timeout_seconds: 10
+    retry_attempts: 3
+  
+  cache:
+    enabled: true
+    directory: "data/cache"
+    ttl_hours: 24
+  
+  storage:
+    raw_data_dir: "data/raw"
+    processed_data_dir: "data/processed"
+    model_artifacts_dir: "models"
+
+# Feature Engineering
+features:
+  # Rolling window sizes for player stats
+  rolling_windows:
+    short: 5      # Last 5 games
+    medium: 10    # Last 10 games
+    long: 20      # Last 20 games
+    season: null  # Full season to date
+  
+  # Minimum games required for reliable stats
+  min_games:
+    player_stats: 5
+    team_stats: 10
+    venue_adjustment: 20  # Per venue
+  
+  # Time-on-ice bins (for categorical features)
+  toi_bins: [0, 10, 14, 18, 22, 30]  # minutes
+  
+  # Strength states to track
+  strength_states:
+    - "EV5v5"
+    - "PP"
+    - "SH"
+    - "EV4v4"
+    - "EV3v3"
+  
+  # Shot quality features (distance bins in feet)
+  shot_distance_bins: [0, 20, 40, 60, 100, 200]
+  
+  # Exponential weighted moving average decay
+  ewma_alpha: 0.3
+  
+  # Contextual features
+  include_rest_days: true
+  include_travel: true
+  include_home_away: true
+  include_venue_bias: true
+  include_b2b_flag: true
+  include_score_effects: true
+
+# Model Configuration
+model:
+  type: "lightgbm_nb"  # Options: "lightgbm_nb", "statsmodels_nb", "lgbm_poisson"
+  
+  # Target variable
+  target: "shots_on_goal"
+  include_ot_shots: true  # If betting lines include OT
+  
+  # Common lines to evaluate
+  common_lines: [1.5, 2.5, 3.5, 4.5, 5.5]
+  
+  # Negative Binomial specific
+  negative_binomial:
+    distribution: "nb2"  # Options: "nb1", "nb2"
+    min_dispersion: 0.1
+    max_dispersion: 10.0
+  
+  # LightGBM hyperparameters (starting values)
+  lightgbm:
+    mu_model:  # Predicts mean
+      objective: "poisson"
+      boosting_type: "gbdt"
+      num_leaves: 31
+      learning_rate: 0.05
+      n_estimators: 200
+      max_depth: 6
+      min_child_samples: 20
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+      random_state: 42
+      n_jobs: -1
+      verbose: -1
+    
+    alpha_model:  # Predicts dispersion
+      objective: "gamma"
+      boosting_type: "gbdt"
+      num_leaves: 15
+      learning_rate: 0.05
+      n_estimators: 100
+      max_depth: 4
+      min_child_samples: 30
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.5
+      reg_lambda: 2.0
+      random_state: 42
+      n_jobs: -1
+      verbose: -1
+
+# Calibration
+calibration:
+  method: "isotonic"  # Options: "isotonic", "platt", "beta"
+  n_bins: 10
+  min_samples_per_bin: 30
+  
+  # Recalibrate if calibration error exceeds threshold
+  recalibration_threshold: 0.05
+  
+  # Uncertainty inflation for edge cases
+  inflate_uncertainty:
+    enabled: true
+    conditions:
+      - "player_games_played < 10"
+      - "projected_toi_std > 3"
+      - "lineup_confidence < 0.7"
+    inflation_factor: 1.3  # Multiply alpha by this factor
+
+# Validation
+validation:
+  # Time-based splits (percentages of available data)
+  train_pct: 0.70       # 70% for training
+  val_pct: 0.15         # 15% for validation
+  test_pct: 0.15        # 15% for test
+  
+  # Minimum samples required
+  min_train_samples: 500
+  min_val_samples: 100
+  min_test_samples: 100
+  
+  # Purge period between splits (days)
+  purge_days: 7
+  
+  # Primary metrics (in priority order)
+  metrics:
+    - "crps"
+    - "brier_1.5"
+    - "brier_2.5"
+    - "brier_3.5"
+    - "brier_4.5"
+    - "calibration_error"
+    - "log_loss"
+  
+  # Baseline models to beat
+  baselines:
+    - "season_mean"
+    - "ewma_l10"
+    - "opponent_adjusted_mean"
+  
+  # Cross-validation
+  time_series_cv:
+    n_splits: 5
+    test_size_days: 30
+    gap_days: 7
+  
+  # Calibration curve
+  calibration_bins: 10
+  
+  # Confidence interval coverage tests
+  confidence_levels: [0.5, 0.8, 0.9]
+
+# Prediction Pipeline
+prediction:
+  # When to generate predictions (minutes before game)
+  prediction_lead_time_minutes: 90
+  
+  # Projected TOI source
+  toi_projection_method: "ewma"  # Options: "ewma", "season_avg", "l5_avg"
+  
+  # Handle uncertain lineups
+  lineup_uncertainty:
+    use_projection: true
+    confidence_threshold: 0.5
+    fallback_to_season_avg: true
+  
+  # Minimum confidence to emit prediction
+  min_prediction_confidence: 0.3
+  
+  # Output format
+  output:
+    format: "json"  # Options: "json", "csv", "parquet"
+    include_full_pmf: true
+    max_pmf_value: 15  # P(SOG = k) for k = 0 to max_pmf_value
+    include_percentiles: [10, 25, 50, 75, 90]
+    decimal_precision: 4
+
+# Training
+training:
+  # Retraining schedule
+  retrain_frequency_days: 7
+  retrain_day_of_week: "Sunday"
+  
+  # Incremental vs full retrain
+  incremental_training:
+    enabled: false
+    lookback_days: 90
+  
+  # Feature selection
+  feature_selection:
+    enabled: true
+    method: "permutation"  # Options: "permutation", "shap", "none"
+    n_repeats: 5
+    threshold_percentile: 25  # Drop features below this importance percentile
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    rounds: 50
+    metric: "crps"
+
+# Monitoring
+monitoring:
+  # Performance tracking
+  rolling_window_days: 30
+  
+  # Alerts
+  alerts:
+    crps_degradation_threshold: 0.15  # Trigger if CRPS increases by this much
+    calibration_error_threshold: 0.08
+    coverage_deviation_threshold: 0.15  # For confidence intervals
+  
+  # Logging
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_predictions: true
+  log_features: false  # Set true for debugging
+  
+  # Model versioning
+  save_model_artifacts: true
+  model_version_format: "v{date}_{metric}"
+
+# Production
+production:
+  # API settings (if exposing predictions via API)
+  api:
+    enabled: false
+    host: "0.0.0.0"
+    port: 8000
+  
+  # Batch prediction
+  batch:
+    max_players_per_batch: 500
+    parallel_workers: 4
+  
+  # Error handling
+  graceful_degradation: true
+  fallback_to_baseline: true
+
+# Experimentation
+experiment:
+  # A/B testing framework
+  enable_experiments: false
+  
+  # Hyperparameter search
+  hyperparam_tuning:
+    enabled: false
+    method: "optuna"  # Options: "optuna", "grid", "random"
+    n_trials: 100
+    timeout_hours: 24
+  
+  # Feature experiments
+  ablation_studies:
+    enabled: false
+    features_to_test: []
+
+# Reproducibility
+random_seed: 42
+deterministic: true
