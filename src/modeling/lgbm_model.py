@@ -348,7 +348,7 @@ class LGBMNegativeBinomialModel:
         return pmfs
     
     def predict_intervals(self, X: pd.DataFrame, 
-                         confidence_level: float = 0.8) -> pd.DataFrame:
+                        confidence_level: float = 0.8) -> pd.DataFrame:
         """
         Predict confidence intervals.
         

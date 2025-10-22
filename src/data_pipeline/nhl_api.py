@@ -212,71 +212,78 @@ class NHLAPIClient:
     
     def get_schedule(self, start_date: datetime, end_date: datetime) -> List[GameInfo]:
         """
-        Fetch schedule for date range.
-        
-        Args:
-            start_date: Start date (inclusive)
-            end_date: End date (inclusive)
-            
-        Returns:
-            List of GameInfo objects
+        Fetch schedule for date range by iterating through each date.
         """
-        games = []
+        all_games = []
         
-        # Make sure start/end dates are timezone-naive for comparison
+        # Normalize to timezone-naive
         if start_date.tzinfo is not None:
             start_date = start_date.replace(tzinfo=None)
         if end_date.tzinfo is not None:
             end_date = end_date.replace(tzinfo=None)
         
-        # NHL API uses YYYY-MM-DD format
-        date_str = start_date.strftime("%Y-%m-%d")
+        # Iterate through each date
+        current_date = start_date.date()
+        end = end_date.date()
         
-        # Fetch schedule
-        try:
-            data = self._request(f"schedule/{date_str}")
-        except Exception as e:
-            logger.warning(f"Failed to fetch schedule for {date_str}: {e}")
-            return games
-        
-        if 'gameWeek' not in data:
-            return games
-        
-        for game_week in data['gameWeek']:
-            for game_data in game_week.get('games', []):
-                try:
-                    # Handle different date field names
-                    game_date_str = game_data.get('gameDate') or game_data.get('startTimeUTC')
-                    if not game_date_str:
+        while current_date <= end:
+            date_str = current_date.strftime("%Y-%m-%d")
+            
+            try:
+                data = self._request(f"schedule/{date_str}")
+            except Exception as e:
+                current_date += timedelta(days=1)
+                continue
+            
+            if 'gameWeek' not in data:
+                current_date += timedelta(days=1)
+                continue
+            
+            # Parse games (existing logic)
+            for game_week in data['gameWeek']:
+                for game_data in game_week.get('games', []):
+                    try:
+                        game_date_str = game_data.get('gameDate') or game_data.get('startTimeUTC')
+                        if not game_date_str:
+                            continue
+                        
+                        game_date = datetime.fromisoformat(game_date_str.replace('Z', '+00:00'))
+                        game_date_naive = game_date.replace(tzinfo=None)
+                        
+                        # Filter by date range
+                        if not (start_date <= game_date_naive <= end_date):
+                            continue
+                        
+                        game = GameInfo(
+                            game_id=game_data['id'],
+                            season=game_data.get('season', ''),
+                            game_type=game_data.get('gameType', ''),
+                            date=game_date_naive,
+                            home_team_id=game_data['homeTeam']['id'],
+                            away_team_id=game_data['awayTeam']['id'],
+                            home_team_abbrev=game_data['homeTeam'].get('abbrev', ''),
+                            away_team_abbrev=game_data['awayTeam'].get('abbrev', ''),
+                            venue_name=game_data.get('venue', {}).get('default', ''),
+                            game_state=game_data.get('gameState', ''),
+                            start_time=game_date_naive
+                        )
+                        
+                        all_games.append(game)
+                        
+                    except (KeyError, ValueError) as e:
                         continue
-                    
-                    game_date = datetime.fromisoformat(game_date_str.replace('Z', '+00:00'))
-                    # Remove timezone info for comparison
-                    game_date_naive = game_date.replace(tzinfo=None)
-                    
-                    # Filter by date range
-                    if not (start_date <= game_date_naive <= end_date):
-                        continue
-                    
-                    game = GameInfo(
-                        game_id=game_data['id'],
-                        season=game_data.get('season', ''),
-                        game_type=game_data.get('gameType', ''),
-                        date=game_date_naive,
-                        home_team_id=game_data['homeTeam']['id'],
-                        away_team_id=game_data['awayTeam']['id'],
-                        home_team_abbrev=game_data['homeTeam'].get('abbrev', ''),
-                        away_team_abbrev=game_data['awayTeam'].get('abbrev', ''),
-                        venue_name=game_data.get('venue', {}).get('default', ''),
-                        game_state=game_data.get('gameState', ''),
-                        start_time=game_date_naive
-                    )
-                    games.append(game)
-                except (KeyError, ValueError) as e:
-                    logger.debug(f"Failed to parse game data: {e}")
-                    continue
+            
+            current_date += timedelta(days=1)
         
-        return games
+        # DEDUPLICATE before returning
+        seen_game_ids = set()
+        unique_games = []
+        for game in all_games:
+            if game.game_id not in seen_game_ids:
+                seen_game_ids.add(game.game_id)
+                unique_games.append(game)
+        
+        return unique_games
     
     def get_game_boxscore(self, game_id: int) -> Dict[str, Any]:
         """

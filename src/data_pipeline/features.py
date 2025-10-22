@@ -637,36 +637,182 @@ class FeatureEngineer:
         }
         
         return pd.DataFrame([data])
-    
+
     def bulk_build_features(self, predictions: List[Dict]) -> pd.DataFrame:
         """
-        Build features for multiple predictions efficiently.
+        Build features for multiple predictions using TRUE vectorization.
         
-        Args:
-            predictions: List of dicts with player/game info
-            
-        Returns:
-            DataFrame with features for all predictions
+        Key insight: Pre-compute rolling stats for ALL player-games at once,
+        then filter to just the ones we need.
         """
-        all_features = []
-        
-        for pred_info in predictions:
-            features = self.build_features(
-                player_id=pred_info['player_id'],
-                player_name=pred_info['player_name'],
-                position=pred_info['position'],
-                team_id=pred_info['team_id'],
-                opponent_team_id=pred_info['opponent_team_id'],
-                game_id=pred_info['game_id'],
-                game_date=pred_info['game_date'],
-                venue_name=pred_info['venue_name'],
-                is_home=pred_info['is_home'],
-                as_of_timestamp=pred_info.get('as_of_timestamp')
-            )
-            
-            all_features.append(self.features_to_dataframe(features))
-        
-        if not all_features:
+        if not predictions:
             return pd.DataFrame()
         
-        return pd.concat(all_features, ignore_index=True)
+        # Convert to DataFrame
+        pred_df = pd.DataFrame(predictions)
+        
+        # Ensure unique identifier
+        if 'game_id' not in pred_df.columns:
+            pred_df['game_id'] = (pred_df['player_id'].astype(str) + '_' + 
+                                pred_df['game_date'].astype(str))
+        
+        # Pre-compute ALL rolling stats for relevant players
+        player_stats = self._precompute_all_player_stats(
+            pred_df['player_id'].unique(),
+            pred_df['game_date'].min(),
+            pred_df['game_date'].max()
+        )
+        
+        # Merge player stats
+        features = pred_df.merge(
+            player_stats,
+            on=['player_id', 'game_date'],
+            how='left'
+        )
+        
+        # Add simple aggregated team/opponent features
+        features = self._add_team_features(features)
+        
+        # Add static features
+        features['is_defense'] = (features['position'] == 'D').astype(int)
+        features['is_forward'] = (features['position'].isin(['C', 'LW', 'RW'])).astype(int)
+        features['venue_encoded'] = pd.util.hash_array(
+            features.get('venue_name', pd.Series(['unknown'] * len(features))).values
+        ) % 100
+        
+        # Drop non-numeric
+        features = features.drop(
+            columns=['position', 'venue_name', 'player_name'], 
+            errors='ignore'
+        )
+        
+        # Fill missing
+        numeric_cols = features.select_dtypes(include=[np.number]).columns
+        features[numeric_cols] = features[numeric_cols].fillna(0)
+        
+        return features
+
+
+    def _precompute_all_player_stats(self, player_ids: np.ndarray, 
+                                    min_date, max_date) -> pd.DataFrame:
+        """
+        Pre-compute rolling stats for all players at once.
+        
+        This is the key optimization: compute stats for ALL games for ALL players
+        in one pass, then filter to what we need.
+        """
+        # Get relevant history
+        history = self.historical_data[
+            (self.historical_data['player_id'].isin(player_ids)) &
+            (self.historical_data['game_date'] <= max_date)
+        ].copy()
+        
+        if len(history) == 0:
+            return pd.DataFrame()
+        
+        # Sort for rolling calculations
+        history = history.sort_values(['player_id', 'game_date'])
+        
+        # Compute rolling stats using groupby + rolling (vectorized!)
+        history['shots_per_game_l10'] = (
+            history.groupby('player_id')['shots']
+            .rolling(10, min_periods=1).mean()
+            .reset_index(0, drop=True)
+        )
+        
+        history['shots_per_game_l20'] = (
+            history.groupby('player_id')['shots']
+            .rolling(20, min_periods=1).mean()
+            .reset_index(0, drop=True)
+        )
+        
+        history['shots_per_game_season'] = (
+            history.groupby('player_id')['shots']
+            .expanding(min_periods=1).mean()
+            .reset_index(0, drop=True)
+        )
+        
+        history['toi_per_game_l10'] = (
+            history.groupby('player_id')['toi_seconds']
+            .rolling(10, min_periods=1).mean()
+            .reset_index(0, drop=True)
+        ) / 60
+        
+        history['toi_per_game_l20'] = (
+            history.groupby('player_id')['toi_seconds']
+            .rolling(20, min_periods=1).mean()
+            .reset_index(0, drop=True)
+        ) / 60
+        
+        history['toi_per_game_season'] = (
+            history.groupby('player_id')['toi_seconds']
+            .expanding(min_periods=1).mean()
+            .reset_index(0, drop=True)
+        ) / 60
+        
+        history['games_played'] = (
+            history.groupby('player_id').cumcount() + 1
+        )
+        
+        # Keep only needed columns
+        return history[[
+            'player_id', 'game_date',
+            'shots_per_game_l10', 'shots_per_game_l20', 'shots_per_game_season',
+            'toi_per_game_l10', 'toi_per_game_l20', 'toi_per_game_season',
+            'games_played'
+        ]]
+
+
+    def _add_team_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add simple team/opponent aggregates.
+        
+        Uses historical data to compute team offensive and opponent defensive stats.
+        """
+        # Get unique team-date combinations we need
+        team_dates = pd.concat([
+            features[['team_id', 'game_date']],
+            features[['opponent_team_id', 'game_date']].rename(columns={'opponent_team_id': 'team_id'})
+        ]).drop_duplicates()
+        
+        # Compute team stats for these dates
+        team_stats = []
+        for _, row in team_dates.iterrows():
+            team_history = self.historical_data[
+                (self.historical_data['team_id'] == row['team_id']) &
+                (self.historical_data['game_date'] < row['game_date'])
+            ].tail(10)  # Last 10 games
+            
+            if len(team_history) > 0:
+                team_stats.append({
+                    'team_id': row['team_id'],
+                    'game_date': row['game_date'],
+                    'team_shots_per_game': team_history.groupby('game_date')['shots'].sum().mean(),
+                    'team_goals_per_game': team_history.groupby('game_date')['goals'].sum().mean()
+                })
+        
+        team_stats_df = pd.DataFrame(team_stats)
+        
+        # Merge team stats
+        features = features.merge(
+            team_stats_df,
+            on=['team_id', 'game_date'],
+            how='left'
+        )
+        
+        # Merge opponent stats (defensive)
+        features = features.merge(
+            team_stats_df.rename(columns={
+                'team_shots_per_game': 'opp_shots_against_per_game',
+                'team_goals_per_game': 'opp_goals_against_per_game'
+            }),
+            left_on=['opponent_team_id', 'game_date'],
+            right_on=['team_id', 'game_date'],
+            how='left',
+            suffixes=('', '_opp')
+        )
+        
+        # Drop duplicate team_id column
+        features = features.drop(columns=['team_id_opp'], errors='ignore')
+        
+        return features

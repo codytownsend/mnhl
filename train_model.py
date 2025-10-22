@@ -33,6 +33,8 @@ from src.modeling.calibration import create_calibrator, save_calibrator
 from src.validation.baselines import create_baseline_models, evaluate_baseline
 from src.validation.metrics import MetricsCalculator
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,16 @@ def collect_historical_data(force_refresh: bool = False) -> pd.DataFrame:
     
     if cache_path.exists() and not force_refresh:
         logger.info(f"Loading cached historical data from {cache_path}")
-        return pd.read_parquet(cache_path)
+        
+        df = pd.read_parquet(cache_path)
+
+        # Deduplicate historical data
+        original_len = len(df)
+        df = df.drop_duplicates(subset=['player_id', 'game_id', 'game_date'])
+        if len(df) < original_len:
+            logger.info(f"Removed {original_len - len(df)} duplicate records from historical data")
+
+        return df
     
     logger.info("Collecting historical data from NHL API")
     collector = HistoricalDataCollector()
@@ -151,7 +162,7 @@ def prepare_training_data(historical_data: pd.DataFrame) -> tuple:
     
     logger.info("Building features for test set")
     X_test, y_test = prepare_features(test_df)
-    
+
     return X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer
 
 
@@ -381,6 +392,11 @@ def main():
         action='store_true',
         help='Skip baseline model training'
     )
+    parser.add_argument(
+    '--save-test-data',
+    action='store_true',
+    help='Save test features and targets for diagnostics'
+    )
     
     args = parser.parse_args()
     
@@ -402,6 +418,21 @@ def main():
     X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer = prepare_training_data(
         historical_data
     )
+
+    # Save test data if requested (for diagnostics)
+    if args.save_test_data:
+        logger.info("Saving test data for diagnostics...")
+        test_data_dir = Path("data/processed")
+        test_data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save features
+        X_test.to_parquet(test_data_dir / "test_features.parquet", index=False)
+        logger.info(f"  Saved {len(X_test)} test features to {test_data_dir / 'test_features.parquet'}")
+        
+        # Save targets
+        test_targets_df = pd.DataFrame({'shots': y_test})
+        test_targets_df.to_parquet(test_data_dir / "test_targets.parquet", index=False)
+        logger.info(f"  Saved {len(y_test)} test targets to {test_data_dir / 'test_targets.parquet'}")
     
     # Get raw dataframes for baselines
     historical_data_sorted = historical_data.sort_values('game_date')

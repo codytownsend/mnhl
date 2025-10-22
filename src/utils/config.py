@@ -375,8 +375,8 @@ class Config:
             include_ot_shots=model['include_ot_shots'],
             common_lines=model['common_lines'],
             nb_distribution=model['negative_binomial']['distribution'],
-            nb_min_dispersion=model['negative_binomial']['min_dispersion'],
-            nb_max_dispersion=model['negative_binomial']['max_dispersion'],
+            nb_min_dispersion=model['negative_binomial']['nb_min_dispersion'],
+            nb_max_dispersion=model['negative_binomial']['nb_max_dispersion'],
             mu_model=mu_model,
             alpha_model=alpha_model,
         )
