@@ -15,31 +15,37 @@ Outputs:
 """
 
 import argparse
-import pickle
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # Import project modules
 import sys
 sys.path.append(str(Path(__file__).parent))
 
 from src.modeling.lgbm_model import LGBMNegativeBinomialModel
+from src.modeling.conformal import load_conformal_calibrator, ConformalIntervalCalibrator
 from src.validation.metrics import MetricsCalculator
 from src.utils.config import load_config, get_config
 
 
-def load_model_and_data(model_dir: Path) -> Tuple[LGBMNegativeBinomialModel, pd.DataFrame, pd.DataFrame]:
+def load_model_and_data(model_dir: Path) -> Tuple[LGBMNegativeBinomialModel, Optional[ConformalIntervalCalibrator], pd.DataFrame, pd.DataFrame]:
     """Load trained model and test data."""
     print(f"Loading model from {model_dir}")
     
     # Load model
     model = LGBMNegativeBinomialModel()
     model.load(model_dir)
+    interval_calibrator = None
+    interval_path = model_dir / "interval_calibrator.pkl"
+    if interval_path.exists():
+        interval_calibrator = load_conformal_calibrator(interval_path)
+    else:
+        print("Warning: interval calibrator not found; using raw model intervals")
     
     # Load test data (should be saved during training)
     test_features_path = Path("data/processed/test_features.parquet")
@@ -55,15 +61,17 @@ def load_model_and_data(model_dir: Path) -> Tuple[LGBMNegativeBinomialModel, pd.
     
     print(f"Loaded {len(X_test)} test samples")
     
-    return model, X_test, y_test
+    return model, interval_calibrator, X_test, y_test
 
 
-def get_predictions(model: LGBMNegativeBinomialModel, X: pd.DataFrame) -> pd.DataFrame:
+def get_predictions(model: LGBMNegativeBinomialModel,
+                    interval_calibrator,
+                    X: pd.DataFrame) -> pd.DataFrame:
     """Generate predictions with full distribution."""
     print("Generating predictions...")
     
     # Get distribution parameters
-    distribution = model.predict_distribution(X)
+    distribution = model.predict_with_uncertainty_adjustment(X)
     
     preds = pd.DataFrame({
         'mu': distribution['mu'],
@@ -75,11 +83,23 @@ def get_predictions(model: LGBMNegativeBinomialModel, X: pd.DataFrame) -> pd.Dat
     for col in probs_df.columns:
         preds[col.replace('p_over_', 'prob_over_')] = probs_df[col]
     
-    # Calculate prediction intervals
-    for conf in [0.5, 0.8, 0.9, 0.95]:
-        intervals = model.predict_intervals(X, confidence_level=conf)
-        preds[f'ci_{int(conf*100)}_lower'] = intervals['lower']
-        preds[f'ci_{int(conf*100)}_upper'] = intervals['upper']
+    confidence_levels = sorted({0.5, 0.8, 0.9, 0.95})
+    if interval_calibrator is not None:
+        interval_df = interval_calibrator.predict(distribution)
+        for col in interval_df.columns:
+            preds[col] = interval_df[col]
+        for conf in confidence_levels:
+            lower_key = f'ci_{int(conf*100)}_lower'
+            upper_key = f'ci_{int(conf*100)}_upper'
+            if lower_key not in preds.columns or upper_key not in preds.columns:
+                intervals = model.predict_intervals(X, confidence_level=conf)
+                preds[lower_key] = intervals['lower']
+                preds[upper_key] = intervals['upper']
+    else:
+        for conf in confidence_levels:
+            intervals = model.predict_intervals(X, confidence_level=conf)
+            preds[f'ci_{int(conf*100)}_lower'] = intervals['lower']
+            preds[f'ci_{int(conf*100)}_upper'] = intervals['upper']
     
     print(f"Generated predictions for {len(preds)} samples")
     return preds
@@ -414,12 +434,50 @@ def generate_recommendations(preds: pd.DataFrame, y_true: pd.Series) -> None:
     print("   → Validate that rolling windows don't look ahead")
 
 
+def find_latest_model_dir(model_root: Path) -> Path:
+    """
+    Locate the most recently updated model directory.
+    
+    Args:
+        model_root: Base directory containing versioned model folders
+        
+    Returns:
+        Path to latest model directory
+        
+    Raises:
+        FileNotFoundError: If no model artifacts are present
+    """
+    if not model_root.exists():
+        raise FileNotFoundError(f"Model artifacts directory not found: {model_root}")
+    
+    candidates = [path for path in model_root.iterdir() if path.is_dir()]
+    
+    if not candidates:
+        raise FileNotFoundError(
+            f"No trained models found in {model_root}. "
+            "Run train_model.py before diagnosing calibration."
+        )
+    
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Diagnose calibration issues')
-    parser.add_argument('--model-dir', type=str, default='models/v20251021_crps',
-                       help='Path to model directory')
+    parser.add_argument(
+        '--model-dir',
+        type=str,
+        default=None,
+        help='Path to model directory (defaults to latest trained model)'
+    )
     args = parser.parse_args()
     load_config('config/model_config.yaml')
+    config = get_config()
+    
+    if args.model_dir:
+        model_dir = Path(args.model_dir)
+    else:
+        model_dir = find_latest_model_dir(config.data.model_artifacts_dir)
+        print(f"No model directory specified. Using latest trained model: {model_dir}")
     
     # Create output directory
     Path('outputs').mkdir(exist_ok=True)
@@ -429,10 +487,10 @@ def main():
     print("="*70)
     
     # Load model and data
-    model, X_test, y_test = load_model_and_data(Path(args.model_dir))
+    model, interval_calibrator, X_test, y_test = load_model_and_data(model_dir)
     
     # Generate predictions
-    preds = get_predictions(model, X_test)
+    preds = get_predictions(model, interval_calibrator, X_test)
     
     # Run diagnostics
     analyze_alpha_distribution(preds)

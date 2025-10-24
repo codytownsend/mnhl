@@ -16,12 +16,15 @@ from pathlib import Path
 import joblib
 from scipy import stats
 from datetime import datetime
+import logging
 
 from src.utils.config import get_config
 from src.validation.metrics import (
     calculate_crps, get_probability_over_line, 
     generate_pmf, calculate_prediction_interval
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LGBMNegativeBinomialModel:
@@ -59,6 +62,9 @@ class LGBMNegativeBinomialModel:
         # Feature importance
         self.feature_importance_mu = None
         self.feature_importance_alpha = None
+        
+        # Dispersion calibration
+        self.alpha_scale = 1.0
     
     def _get_model_params(self, model_type: str) -> Dict:
         """
@@ -273,12 +279,13 @@ class LGBMNegativeBinomialModel:
         
         return history
     
-    def predict_distribution(self, X: pd.DataFrame) -> pd.DataFrame:
+    def predict_distribution(self, X: pd.DataFrame, apply_scale: bool = True) -> pd.DataFrame:
         """
         Predict NB distribution parameters for each sample.
         
         Args:
             X: Feature DataFrame
+            apply_scale: Whether to apply learned dispersion scaling
             
         Returns:
             DataFrame with columns [mu, alpha]
@@ -292,6 +299,9 @@ class LGBMNegativeBinomialModel:
         mu_pred = self.mu_model.predict(X_processed)
         alpha_pred = self.alpha_model.predict(X_processed)
         
+        if apply_scale:
+            alpha_pred = alpha_pred * self.alpha_scale
+        
         # Clip predictions to valid ranges
         mu_pred = np.maximum(mu_pred, 0.1)  # Ensure positive mean
         alpha_pred = np.clip(
@@ -304,6 +314,132 @@ class LGBMNegativeBinomialModel:
             'mu': mu_pred,
             'alpha': alpha_pred
         })
+    
+    def calibrate_dispersion(self, X_val: pd.DataFrame, y_val: np.ndarray,
+                             confidence_levels: Optional[List[float]] = None) -> None:
+        """
+        Calibrate dispersion (alpha) via scalar adjustment to improve coverage.
+        
+        Args:
+            X_val: Validation feature set
+            y_val: Validation targets
+            confidence_levels: Confidence levels to match (defaults to config)
+        """
+        if X_val is None or y_val is None or len(X_val) == 0:
+            logger.info("Dispersion calibration skipped: no validation data")
+            return
+        
+        if confidence_levels is None:
+            confidence_levels = self.config.validation.confidence_levels
+        
+        if not confidence_levels:
+            logger.info("Dispersion calibration skipped: no confidence levels configured")
+            return
+        
+        # Reset any prior scaling for fresh calibration
+        self.alpha_scale = 1.0
+        
+        base_params = self.predict_distribution(X_val, apply_scale=False)
+        mu = base_params['mu'].to_numpy()
+        alpha = base_params['alpha'].to_numpy()
+        actuals = np.asarray(y_val)
+        
+        if mu.size == 0 or actuals.size == 0:
+            logger.info("Dispersion calibration skipped: empty validation predictions")
+            return
+        
+        min_disp = self.config.model.nb_min_dispersion
+        max_disp = self.config.model.nb_max_dispersion
+        
+        min_scale = 0.5
+        max_scale = 3.0
+        tolerance = 0.01  # 1% coverage tolerance
+        max_iter = 25
+        
+        coverage_cache = {level: {} for level in confidence_levels}
+        
+        def coverage_for_scale(level: float, scale: float) -> float:
+            key = round(scale, 6)
+            cached = coverage_cache[level].get(key)
+            if cached is not None:
+                return cached
+            
+            scaled_alpha = np.clip(alpha * scale, min_disp, max_disp)
+            lower_pct = (1 - level) / 2
+            upper_pct = 1 - lower_pct
+            p = scaled_alpha / (scaled_alpha + mu)
+            
+            lower = stats.nbinom.ppf(lower_pct, scaled_alpha, p)
+            upper = stats.nbinom.ppf(upper_pct, scaled_alpha, p)
+            coverage_val = np.mean((actuals >= lower) & (actuals <= upper))
+            
+            coverage_cache[level][key] = float(coverage_val)
+            return coverage_val
+        
+        level_scales = []
+        base_coverages = {}
+        
+        for level in confidence_levels:
+            target = level
+            base_cov = coverage_for_scale(level, 1.0)
+            base_coverages[level] = base_cov
+            
+            if abs(base_cov - target) <= tolerance:
+                continue  # already good for this level
+            
+            if base_cov > target:
+                # Intervals too wide -> increase alpha (scale > 1)
+                low, high = 1.0, max_scale
+                cov_high = coverage_for_scale(level, high)
+                if cov_high > target + tolerance:
+                    # Cannot reach target due to max dispersion cap
+                    level_scales.append(high)
+                    continue
+            else:
+                # Intervals too narrow -> decrease alpha (scale < 1)
+                low, high = min_scale, 1.0
+                cov_low = coverage_for_scale(level, low)
+                if cov_low < target - tolerance:
+                    # Cannot reach target even at min scale
+                    level_scales.append(low)
+                    continue
+            
+            scale_low, scale_high = low, high
+            for _ in range(max_iter):
+                mid = (scale_low + scale_high) / 2
+                cov_mid = coverage_for_scale(level, mid)
+                
+                if abs(cov_mid - target) <= tolerance:
+                    scale_low = scale_high = mid
+                    break
+                
+                if cov_mid > target:
+                    scale_low = mid
+                else:
+                    scale_high = mid
+            
+            level_scales.append((scale_low + scale_high) / 2)
+        
+        if not level_scales:
+            logger.info("Dispersion calibration not needed; coverage within tolerance for all levels")
+            self.alpha_scale = 1.0
+            return
+        
+        new_scale = float(np.median(level_scales))
+        new_scale = np.clip(new_scale, min_scale, max_scale)
+        self.alpha_scale = new_scale
+        
+        post_coverages = {
+            level: coverage_for_scale(level, self.alpha_scale)
+            for level in confidence_levels
+        }
+        
+        logger.info(
+            "Dispersion calibration complete: scale=%.3f, base_coverages=%s, calibrated_coverages=%s",
+            self.alpha_scale,
+            {round(k, 2): round(v, 3) for k, v in base_coverages.items()},
+            {round(k, 2): round(v, 3) for k, v in post_coverages.items()}
+        )
     
     def predict_probabilities(self, X: pd.DataFrame) -> pd.DataFrame:
         """
@@ -457,6 +593,7 @@ class LGBMNegativeBinomialModel:
             'feature_importance_mu': self.feature_importance_mu,
             'feature_importance_alpha': self.feature_importance_alpha,
             'config_override': self.config_override,
+            'alpha_scale': self.alpha_scale,
         }
         
         joblib.dump(metadata, path / 'metadata.pkl')
@@ -484,6 +621,7 @@ class LGBMNegativeBinomialModel:
         self.feature_importance_mu = metadata['feature_importance_mu']
         self.feature_importance_alpha = metadata['feature_importance_alpha']
         self.config_override = metadata.get('config_override', {})
+        self.alpha_scale = metadata.get('alpha_scale', 1.0)
         
         print(f"Model loaded from {path}")
         print(f"Version: {self.version}, trained: {self.training_date}")

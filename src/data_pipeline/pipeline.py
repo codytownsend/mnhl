@@ -22,6 +22,10 @@ from src.data_pipeline.nhl_api import NHLAPIClient, create_nhl_client, PlayerGam
 from src.data_pipeline.features import FeatureEngineer, PlayerFeatures
 from src.modeling.lgbm_model import LGBMNegativeBinomialModel
 from src.modeling.calibration import MultiLineCalibrator, create_calibrator
+from src.modeling.conformal import (
+    ConformalIntervalCalibrator,
+    load_conformal_calibrator
+)
 from src.validation.baselines import create_baseline_models
 from src.utils.config import get_config
 
@@ -191,29 +195,41 @@ class PredictionPipeline:
     def __init__(self, 
                  model: Optional[LGBMNegativeBinomialModel] = None,
                  calibrator: Optional[MultiLineCalibrator] = None,
-                 historical_data: Optional[pd.DataFrame] = None):
+                 interval_calibrator: Optional[ConformalIntervalCalibrator] = None,
+                 historical_data: Optional[pd.DataFrame] = None,
+                 model_dir: Optional[Path] = None):
         """
         Initialize prediction pipeline.
         
         Args:
             model: Trained model (loads from disk if None)
             calibrator: Fitted calibrator (loads from disk if None)
+            interval_calibrator: Conformal interval calibrator
             historical_data: Historical data for feature engineering
+            model_dir: Explicit directory containing model artifacts
         """
         self.config = get_config()
         self.client = create_nhl_client()
+        self.model_dir: Optional[Path] = Path(model_dir) if model_dir is not None else None
         
         # Load or use provided model
         if model is None:
             self.model = self._load_latest_model()
         else:
             self.model = model
-        
+            if self.model_dir is None:
+                logger.warning("Model directory not provided; calibrator loading may fail")
+       
         # Load or use provided calibrator
         if calibrator is None:
             self.calibrator = self._load_calibrator()
         else:
             self.calibrator = calibrator
+        
+        if interval_calibrator is None:
+            self.interval_calibrator = self._load_interval_calibrator()
+        else:
+            self.interval_calibrator = interval_calibrator
         
         # Initialize feature engineer
         if historical_data is None:
@@ -236,12 +252,17 @@ class PredictionPipeline:
         
         model = LGBMNegativeBinomialModel()
         model.load(latest_model_dir)
+        self.model_dir = latest_model_dir
         
         return model
     
     def _load_calibrator(self) -> Optional[MultiLineCalibrator]:
         """Load calibrator if available."""
-        calibrator_path = self.config.data.model_artifacts_dir / "calibrator.pkl"
+        if self.model_dir is None:
+            logger.warning("Model directory unknown; skipping probability calibrator load")
+            return None
+        
+        calibrator_path = self.model_dir / "calibrator.pkl"
         
         if not calibrator_path.exists():
             logger.warning("No calibrator found, predictions will be uncalibrated")
@@ -249,6 +270,20 @@ class PredictionPipeline:
         
         from src.modeling.calibration import load_calibrator
         return load_calibrator(calibrator_path)
+    
+    def _load_interval_calibrator(self) -> Optional[ConformalIntervalCalibrator]:
+        """Load conformal interval calibrator if available."""
+        if self.model_dir is None:
+            logger.warning("Model directory unknown; skipping interval calibrator load")
+            return None
+        
+        calibrator_path = self.model_dir / "interval_calibrator.pkl"
+        
+        if not calibrator_path.exists():
+            logger.info("No interval calibrator found; using model intervals directly")
+            return None
+        
+        return load_conformal_calibrator(calibrator_path)
     
     def _load_historical_data(self) -> pd.DataFrame:
         """Load historical data for feature engineering."""
@@ -362,9 +397,16 @@ class PredictionPipeline:
                 if col.endswith('_calibrated'):
                     probs[col] = calibrated[col]
         
-        # Calculate confidence intervals
-        intervals_80 = self.model.predict_intervals(features_df, confidence_level=0.8)
-        intervals_90 = self.model.predict_intervals(features_df, confidence_level=0.9)
+        # Calculate confidence intervals (conformal if available)
+        if self.interval_calibrator is not None:
+            intervals_df = self.interval_calibrator.predict(dist_params)
+        else:
+            intervals_df = pd.DataFrame(index=dist_params.index)
+            for level in self.config.validation.confidence_levels:
+                base = self.model.predict_intervals(features_df, confidence_level=level)
+                key = f'ci_{int(level*100)}'
+                intervals_df[f'{key}_lower'] = base['lower']
+                intervals_df[f'{key}_upper'] = base['upper']
         
         # Combine into output DataFrame
         output = pd.DataFrame({
@@ -391,9 +433,20 @@ class PredictionPipeline:
             output[col] = probs[col]
         
         # Add intervals
-        output['p10'] = intervals_80['lower']
+        for col in intervals_df.columns:
+            output[col] = intervals_df[col]
+        
+        ci80_lower_col = 'ci_80_lower'
+        ci80_upper_col = 'ci_80_upper'
+        if ci80_lower_col in intervals_df.columns and ci80_upper_col in intervals_df.columns:
+            output['p10'] = intervals_df[ci80_lower_col]
+            output['p90'] = intervals_df[ci80_upper_col]
+        else:
+            fallback = self.model.predict_intervals(features_df, confidence_level=0.8)
+            output['p10'] = fallback['lower']
+            output['p90'] = fallback['upper']
+        
         output['p50'] = dist_params['mu'].round().astype(int)
-        output['p90'] = intervals_90['upper']
         
         # Add confidence metrics
         output['projected_toi'] = features_df['projected_toi']

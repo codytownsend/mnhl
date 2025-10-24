@@ -325,6 +325,9 @@ class TestFeatureEngineer:
         # Check uncertainty metrics
         assert 0 <= features.lineup_confidence <= 1
         assert features.projected_toi > 0
+        assert features.team_shots_for_l5 >= 0
+        assert 0 <= features.player_shot_share_team_l10 <= 1
+        assert features.player_vs_opponent_games_l10 >= 0
     
     def test_features_to_dataframe(self, setup_test_config, sample_historical_data):
         """Test conversion to DataFrame."""
@@ -348,6 +351,10 @@ class TestFeatureEngineer:
         assert len(df) == 1
         assert 'player_id' in df.columns
         assert 'toi_per_game_l10' in df.columns
+        assert 'shots_trend_l5_vs_l20' in df.columns
+        assert 'rest_advantage' in df.columns
+        assert 'team_shots_for_l5' in df.columns
+        assert 'player_shot_share_team_l10' in df.columns
     
     def test_bulk_build_features(self, setup_test_config, sample_historical_data):
         """Test bulk feature building."""

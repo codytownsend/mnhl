@@ -84,6 +84,39 @@ class PlayerFeatures:
     lineup_confidence: float  # 0-1, how certain are we about role/TOI
     projected_toi: float
     projected_toi_std: float
+    
+    # Trend/consistency features
+    shots_trend_l5_vs_l20: float
+    toi_trend_l5_vs_l20: float
+    shot_consistency_l10: float
+    toi_consistency_l10: float
+    
+    # Opponent/advantage context
+    opponent_rest_days: int
+    team_rest_days: int
+    rest_advantage: int
+    
+    # Team form features
+    team_shots_for_l5: float
+    team_shots_against_l5: float
+    team_goals_for_l5: float
+    team_goals_against_l5: float
+    team_shot_share_l5: float
+    team_pace_l5: float
+    
+    # Opponent form features
+    opponent_shots_against_l5: float
+    opponent_goals_against_l5: float
+    opponent_shot_share_allowed_l5: float
+    opponent_pace_allowed_l5: float
+    
+    # Player-to-team relationships
+    player_shot_share_team_l10: float
+    player_pp_share_team_l10: float
+    
+    # Player vs opponent history
+    player_vs_opponent_shots_l10: float
+    player_vs_opponent_games_l10: int
 
 
 class FeatureEngineer:
@@ -107,8 +140,24 @@ class FeatureEngineer:
         self.historical_data = historical_data if historical_data is not None else pd.DataFrame()
         
         # Precompute team-level statistics
-        self.team_stats = self._compute_team_stats() if not self.historical_data.empty else {}
-        self.venue_bias = self._compute_venue_bias() if not self.historical_data.empty else {}
+        if not self.historical_data.empty:
+            self.team_stats = self._compute_team_stats()
+            self.venue_bias = self._compute_venue_bias()
+            self.team_game_stats = self._build_team_game_stats()
+            self.team_game_stats_by_team = {
+                team_id: df.sort_values('game_date')
+                for team_id, df in self.team_game_stats.groupby('team_id')
+            }
+            self.player_history = {
+                player_id: df.sort_values('game_date')
+                for player_id, df in self.historical_data.groupby('player_id')
+            }
+        else:
+            self.team_stats = {}
+            self.venue_bias = {}
+            self.team_game_stats = pd.DataFrame()
+            self.team_game_stats_by_team = {}
+            self.player_history = {}
         
     def _compute_team_stats(self) -> Dict[int, Dict[str, float]]:
         """Compute rolling team-level statistics."""
@@ -171,6 +220,53 @@ class FeatureEngineer:
             venue_bias[venue] = np.clip(bias, -0.5, 0.5)
         
         return venue_bias
+    
+    def _build_team_game_stats(self) -> pd.DataFrame:
+        """Aggregate team-level totals per game for advanced features."""
+        if self.historical_data.empty:
+            return pd.DataFrame(columns=[
+                'team_id', 'game_id', 'game_date', 'opponent_team_id', 'home_away',
+                'shots', 'goals', 'toi_seconds', 'pp_toi_seconds', 'sh_toi_seconds',
+                'opp_shots', 'opp_goals', 'opp_pp_toi_seconds', 'opp_sh_toi_seconds',
+                'shot_share', 'pace'
+            ])
+
+        grouped = (
+            self.historical_data
+            .groupby(['team_id', 'game_id', 'game_date', 'opponent_team_id', 'home_away'], as_index=False)
+            .agg({
+                'shots': 'sum',
+                'goals': 'sum',
+                'toi_seconds': 'sum',
+                'pp_toi_seconds': 'sum',
+                'sh_toi_seconds': 'sum'
+            })
+        )
+
+        opponent_totals = grouped[['team_id', 'game_id', 'shots', 'goals', 'pp_toi_seconds', 'sh_toi_seconds']].rename(columns={
+            'team_id': 'opponent_team_id',
+            'shots': 'opp_shots',
+            'goals': 'opp_goals',
+            'pp_toi_seconds': 'opp_pp_toi_seconds',
+            'sh_toi_seconds': 'opp_sh_toi_seconds'
+        })
+
+        merged = grouped.merge(
+            opponent_totals,
+            on=['game_id', 'opponent_team_id'],
+            how='left'
+        )
+
+        merged['opp_shots'] = merged['opp_shots'].fillna(merged['shots'])
+        merged['opp_goals'] = merged['opp_goals'].fillna(merged['goals'])
+        merged['opp_pp_toi_seconds'] = merged['opp_pp_toi_seconds'].fillna(0.0)
+        merged['opp_sh_toi_seconds'] = merged['opp_sh_toi_seconds'].fillna(0.0)
+
+        total_shots = merged['shots'] + merged['opp_shots']
+        merged['shot_share'] = np.where(total_shots > 0, merged['shots'] / total_shots, 0.5)
+        merged['pace'] = np.where(np.isnan(total_shots), merged['shots'], total_shots)
+
+        return merged
     
     def compute_rolling_stats(self, player_id: int, as_of_date: datetime,
                               window: int) -> Dict[str, float]:
@@ -337,6 +433,116 @@ class FeatureEngineer:
         
         return max(0, rest_days)
     
+    def _calculate_team_rest_days(self, team_id: int, game_date: datetime) -> int:
+        """
+        Calculate rest days for a team prior to the given game date.
+        
+        Args:
+            team_id: Team identifier
+            game_date: Upcoming game date
+        
+        Returns:
+            Rest days as integer (defaults to 1 if insufficient history)
+        """
+        if self.historical_data.empty:
+            return 1
+        
+        team_games = self.historical_data[
+            (self.historical_data['team_id'] == team_id) &
+            (self.historical_data['game_date'] < game_date)
+        ].sort_values('game_date', ascending=False)
+        
+        if team_games.empty:
+            return 1
+        
+        last_game_date = team_games.iloc[0]['game_date']
+        rest_days = (game_date - last_game_date).days
+        
+        return max(0, rest_days)
+
+    def _get_default_team_form(self) -> Dict[str, float]:
+        return {
+            'shots_for': 30.0,
+            'shots_against': 30.0,
+            'goals_for': 3.0,
+            'goals_against': 3.0,
+            'shot_share': 0.5,
+            'pace': 60.0,
+        }
+
+    def _get_team_recent_stats(self, team_id: int, as_of_date: datetime,
+                               window: int = 5) -> Dict[str, float]:
+        team_history = self.team_game_stats_by_team.get(team_id)
+        if team_history is None:
+            return self._get_default_team_form()
+        recent = team_history[team_history['game_date'] < as_of_date].tail(window)
+        if recent.empty:
+            return self._get_default_team_form()
+        shots_for = recent['shots'].mean()
+        shots_against = recent['opp_shots'].mean()
+        goals_for = recent['goals'].mean()
+        goals_against = recent['opp_goals'].mean()
+        shot_share = np.clip(recent['shot_share'].mean(), 0.0, 1.0)
+        pace = recent['pace'].mean()
+        return {
+            'shots_for': float(shots_for),
+            'shots_against': float(shots_against),
+            'goals_for': float(goals_for),
+            'goals_against': float(goals_against),
+            'shot_share': float(shot_share),
+            'pace': float(pace),
+        }
+
+    def _get_player_team_share(self, player_id: int, team_id: int,
+                               as_of_date: datetime,
+                               window: int = 10) -> Dict[str, float]:
+        player_games = self.player_history.get(player_id)
+        team_history = self.team_game_stats_by_team.get(team_id)
+        if player_games is None or team_history is None:
+            return {'shot_share': 0.0, 'pp_share': 0.0}
+        recent_player = player_games[player_games['game_date'] < as_of_date].tail(window)
+        if recent_player.empty:
+            return {'shot_share': 0.0, 'pp_share': 0.0}
+        team_totals = team_history[['game_id', 'shots', 'pp_toi_seconds']]
+        merged = recent_player.merge(team_totals, on='game_id', how='left', suffixes=('', '_team'))
+        merged = merged.dropna(subset=['shots_team'])
+        if merged.empty:
+            return {'shot_share': 0.0, 'pp_share': 0.0}
+        total_team_shots = merged['shots_team']
+        total_team_pp = merged['pp_toi_seconds_team']
+
+        valid_shots = total_team_shots > 0
+        if valid_shots.any():
+            shot_share_vals = merged.loc[valid_shots, 'shots'] / total_team_shots.loc[valid_shots]
+            shot_share = float(np.clip(shot_share_vals.mean(), 0.0, 1.0))
+        else:
+            shot_share = 0.0
+
+        valid_pp = total_team_pp > 0
+        if valid_pp.any():
+            pp_share_vals = merged.loc[valid_pp, 'pp_toi_seconds'] / total_team_pp.loc[valid_pp]
+            pp_share = float(np.clip(pp_share_vals.mean(), 0.0, 1.0))
+        else:
+            pp_share = 0.0
+
+        return {'shot_share': shot_share, 'pp_share': pp_share}
+
+    def _get_player_opponent_history(self, player_id: int, opponent_team_id: int,
+                                     as_of_date: datetime, fallback: float,
+                                     window: int = 10) -> Dict[str, float]:
+        player_games = self.player_history.get(player_id)
+        if player_games is None:
+            return {'avg_shots': fallback, 'games_played': 0}
+        head_to_head = player_games[
+            (player_games['opponent_team_id'] == opponent_team_id) &
+            (player_games['game_date'] < as_of_date)
+        ].tail(window)
+        if head_to_head.empty:
+            return {'avg_shots': fallback, 'games_played': 0}
+        avg_shots = head_to_head['shots'].mean()
+        games = len(head_to_head)
+        return {'avg_shots': float(avg_shots), 'games_played': int(games)}
+    
     def estimate_travel_distance(self, home_venue: str, away_venue: str,
                                   is_home: bool, last_venue: Optional[str]) -> float:
         """
@@ -469,35 +675,51 @@ class FeatureEngineer:
         if as_of_timestamp is None:
             as_of_timestamp = datetime.now()
         
+        # Ensure we never peek past the prediction timestamp
+        cutoff_timestamp = min(game_date, as_of_timestamp)
+        
         # Rolling window statistics
-        stats_l5 = self.compute_rolling_stats(player_id, game_date, 5)
-        stats_l10 = self.compute_rolling_stats(player_id, game_date, 10)
-        stats_l20 = self.compute_rolling_stats(player_id, game_date, 20)
-        stats_season = self.compute_rolling_stats(player_id, game_date, 999)
+        stats_l5 = self.compute_rolling_stats(player_id, cutoff_timestamp, 5)
+        stats_l10 = self.compute_rolling_stats(player_id, cutoff_timestamp, 10)
+        stats_l20 = self.compute_rolling_stats(player_id, cutoff_timestamp, 20)
+        stats_season = self.compute_rolling_stats(player_id, cutoff_timestamp, 999)
         
         # EWMA statistics
-        ewma_stats = self.compute_ewma_stats(player_id, game_date)
+        ewma_stats = self.compute_ewma_stats(player_id, cutoff_timestamp)
         
         # Opponent statistics
-        opp_stats = self.get_opponent_stats(opponent_team_id, game_date)
+        opp_stats = self.get_opponent_stats(opponent_team_id, cutoff_timestamp)
         
         # Team context
         team_pace = self.team_stats.get(team_id, {}).get('pace', 50.0)
         team_shot_share = self.team_stats.get(team_id, {}).get('shot_share', 0.50)
+        team_form = self._get_team_recent_stats(team_id, cutoff_timestamp, window=5)
+        opponent_form = self._get_team_recent_stats(opponent_team_id, cutoff_timestamp, window=5)
+        player_team_share = self._get_player_team_share(player_id, team_id, cutoff_timestamp, window=10)
+        opponent_history = self._get_player_opponent_history(
+            player_id,
+            opponent_team_id,
+            cutoff_timestamp,
+            fallback=stats_season['avg_shots'],
+            window=10
+        )
         
-        opponent_pace = self.team_stats.get(opponent_team_id, {}).get('pace', 50.0)
-        expected_game_pace = (team_pace + opponent_pace) / 2
+        opponent_pace = opponent_form['pace'] if opponent_form else self.team_stats.get(opponent_team_id, {}).get('pace', 50.0)
+        expected_game_pace = (team_form['pace'] + opponent_form['pace']) / 2 if team_form and opponent_form else (team_pace + opponent_pace) / 2
         
         # Situational
         rest_days = self.calculate_rest_days(player_id, game_date)
+        team_rest_days = self._calculate_team_rest_days(team_id, game_date)
+        opponent_rest_days = self._calculate_team_rest_days(opponent_team_id, game_date)
+        rest_advantage = team_rest_days - opponent_rest_days
         back_to_back = 1 if rest_days == 0 else 0
         
         # Venue bias
         venue_bias = self.venue_bias.get(venue_name, 0.0)
         
         # Role inference
-        pp_unit = self.infer_pp_unit(player_id, game_date)
-        line_number = self.estimate_line_number(player_id, game_date, position)
+        pp_unit = self.infer_pp_unit(player_id, cutoff_timestamp)
+        line_number = self.estimate_line_number(player_id, cutoff_timestamp, position)
         
         # Uncertainty metrics
         games_played = stats_season['games_played']
@@ -505,6 +727,13 @@ class FeatureEngineer:
         
         projected_toi = ewma_stats['ewma_toi']
         projected_toi_std = stats_l10['std_toi']
+        
+        # Trend features capture recent momentum
+        shots_trend = stats_l5['avg_shots'] - stats_l20['avg_shots']
+        toi_trend = stats_l5['avg_toi'] - stats_l20['avg_toi']
+        
+        shot_consistency = stats_l10['std_shots']
+        toi_consistency = stats_l10['std_toi']
         
         return PlayerFeatures(
             player_id=player_id,
@@ -571,6 +800,28 @@ class FeatureEngineer:
             lineup_confidence=lineup_confidence,
             projected_toi=projected_toi,
             projected_toi_std=projected_toi_std,
+            
+            shots_trend_l5_vs_l20=shots_trend,
+            toi_trend_l5_vs_l20=toi_trend,
+            shot_consistency_l10=shot_consistency,
+            toi_consistency_l10=toi_consistency,
+            opponent_rest_days=opponent_rest_days,
+            team_rest_days=team_rest_days,
+            rest_advantage=rest_advantage,
+            team_shots_for_l5=team_form['shots_for'],
+            team_shots_against_l5=team_form['shots_against'],
+            team_goals_for_l5=team_form['goals_for'],
+            team_goals_against_l5=team_form['goals_against'],
+            team_shot_share_l5=team_form['shot_share'],
+            team_pace_l5=team_form['pace'],
+            opponent_shots_against_l5=opponent_form['shots_against'],
+            opponent_goals_against_l5=opponent_form['goals_against'],
+            opponent_shot_share_allowed_l5=1 - opponent_form['shot_share'],
+            opponent_pace_allowed_l5=opponent_form['pace'],
+            player_shot_share_team_l10=player_team_share['shot_share'],
+            player_pp_share_team_l10=player_team_share['pp_share'],
+            player_vs_opponent_shots_l10=opponent_history['avg_shots'],
+            player_vs_opponent_games_l10=opponent_history['games_played'],
         )
     
     def features_to_dataframe(self, features: PlayerFeatures) -> pd.DataFrame:
@@ -634,133 +885,113 @@ class FeatureEngineer:
             'lineup_confidence': features.lineup_confidence,
             'projected_toi': features.projected_toi,
             'projected_toi_std': features.projected_toi_std,
+            
+            # Trend/consistency
+            'shots_trend_l5_vs_l20': features.shots_trend_l5_vs_l20,
+            'toi_trend_l5_vs_l20': features.toi_trend_l5_vs_l20,
+            'shot_consistency_l10': features.shot_consistency_l10,
+            'toi_consistency_l10': features.toi_consistency_l10,
+            
+            # Rest context
+            'opponent_rest_days': features.opponent_rest_days,
+            'team_rest_days': features.team_rest_days,
+            'rest_advantage': features.rest_advantage,
+            
+            # Team form
+            'team_shots_for_l5': features.team_shots_for_l5,
+            'team_shots_against_l5': features.team_shots_against_l5,
+            'team_goals_for_l5': features.team_goals_for_l5,
+            'team_goals_against_l5': features.team_goals_against_l5,
+            'team_shot_share_l5': features.team_shot_share_l5,
+            'team_pace_l5': features.team_pace_l5,
+            
+            # Opponent form
+            'opponent_shots_against_l5': features.opponent_shots_against_l5,
+            'opponent_goals_against_l5': features.opponent_goals_against_l5,
+            'opponent_shot_share_allowed_l5': features.opponent_shot_share_allowed_l5,
+            'opponent_pace_allowed_l5': features.opponent_pace_allowed_l5,
+            
+            # Player/team relationships
+            'player_shot_share_team_l10': features.player_shot_share_team_l10,
+            'player_pp_share_team_l10': features.player_pp_share_team_l10,
+            
+            # Player vs opponent history
+            'player_vs_opponent_shots_l10': features.player_vs_opponent_shots_l10,
+            'player_vs_opponent_games_l10': features.player_vs_opponent_games_l10,
         }
         
         return pd.DataFrame([data])
 
     def bulk_build_features(self, predictions: List[Dict]) -> pd.DataFrame:
         """
-        Build features for multiple predictions using TRUE vectorization.
+        Build features for multiple predictions.
         
-        Key insight: Pre-compute rolling stats for ALL player-games at once,
-        then filter to just the ones we need.
+        Processes each prediction independently to ensure rolling windows
+        respect the provided as_of timestamp and never leak future data.
         """
         if not predictions:
             return pd.DataFrame()
         
-        # Convert to DataFrame
         pred_df = pd.DataFrame(predictions)
+        feature_frames: List[pd.DataFrame] = []
         
-        # Ensure unique identifier
-        if 'game_id' not in pred_df.columns:
-            pred_df['game_id'] = (pred_df['player_id'].astype(str) + '_' + 
-                                pred_df['game_date'].astype(str))
+        # Iterate row-wise to ensure each prediction uses history strictly
+        # before its game_date. This avoids leakage and the zero-feature bug
+        # we observed when future dates were not present in the training history.
+        for row in pred_df.itertuples(index=False):
+            as_of_ts = getattr(row, 'as_of_timestamp', None)
+            venue_name = getattr(row, 'venue_name', 'unknown')
+            is_home = getattr(row, 'is_home', False)
+            
+            player_features = self.build_features(
+                player_id=row.player_id,
+                player_name=row.player_name,
+                position=row.position,
+                team_id=row.team_id,
+                opponent_team_id=row.opponent_team_id,
+                game_id=row.game_id,
+                game_date=row.game_date,
+                venue_name=venue_name,
+                is_home=is_home,
+                as_of_timestamp=as_of_ts
+            )
+            
+            feature_df = self.features_to_dataframe(player_features)
+            
+            # Re-attach contextual identifiers used downstream
+            feature_df['team_id'] = row.team_id
+            feature_df['opponent_team_id'] = row.opponent_team_id
+            feature_df['game_date'] = row.game_date
+            feature_df['position'] = row.position
+            feature_df['player_name'] = row.player_name
+            feature_df['venue_name'] = venue_name
+            
+            if as_of_ts is not None:
+                feature_df['as_of_timestamp'] = as_of_ts
+            
+            feature_frames.append(feature_df)
         
-        # Pre-compute ALL rolling stats for relevant players
-        player_stats = self._precompute_all_player_stats(
-            pred_df['player_id'].unique(),
-            pred_df['game_date'].min(),
-            pred_df['game_date'].max()
-        )
+        features = pd.concat(feature_frames, ignore_index=True)
         
-        # Merge player stats
-        features = pred_df.merge(
-            player_stats,
-            on=['player_id', 'game_date'],
-            how='left'
-        )
+        # Hash venue for categorical representation
+        if 'venue_name' in features.columns:
+            features['venue_encoded'] = pd.util.hash_array(
+                features['venue_name'].fillna('unknown').astype(str).values
+            ) % 100
         
-        # Add simple aggregated team/opponent features
+        # Add aggregated team/opponent context derived from historical data
         features = self._add_team_features(features)
         
-        # Add static features
-        features['is_defense'] = (features['position'] == 'D').astype(int)
-        features['is_forward'] = (features['position'].isin(['C', 'LW', 'RW'])).astype(int)
-        features['venue_encoded'] = pd.util.hash_array(
-            features.get('venue_name', pd.Series(['unknown'] * len(features))).values
-        ) % 100
-        
-        # Drop non-numeric
+        # Drop non-numeric identifiers before modeling
         features = features.drop(
-            columns=['position', 'venue_name', 'player_name'], 
+            columns=['position', 'venue_name', 'player_name'],
             errors='ignore'
         )
         
-        # Fill missing
         numeric_cols = features.select_dtypes(include=[np.number]).columns
         features[numeric_cols] = features[numeric_cols].fillna(0)
         
         return features
-
-
-    def _precompute_all_player_stats(self, player_ids: np.ndarray, 
-                                    min_date, max_date) -> pd.DataFrame:
-        """
-        Pre-compute rolling stats for all players at once.
-        
-        This is the key optimization: compute stats for ALL games for ALL players
-        in one pass, then filter to what we need.
-        """
-        # Get relevant history
-        history = self.historical_data[
-            (self.historical_data['player_id'].isin(player_ids)) &
-            (self.historical_data['game_date'] <= max_date)
-        ].copy()
-        
-        if len(history) == 0:
-            return pd.DataFrame()
-        
-        # Sort for rolling calculations
-        history = history.sort_values(['player_id', 'game_date'])
-        
-        # Compute rolling stats using groupby + rolling (vectorized!)
-        history['shots_per_game_l10'] = (
-            history.groupby('player_id')['shots']
-            .rolling(10, min_periods=1).mean()
-            .reset_index(0, drop=True)
-        )
-        
-        history['shots_per_game_l20'] = (
-            history.groupby('player_id')['shots']
-            .rolling(20, min_periods=1).mean()
-            .reset_index(0, drop=True)
-        )
-        
-        history['shots_per_game_season'] = (
-            history.groupby('player_id')['shots']
-            .expanding(min_periods=1).mean()
-            .reset_index(0, drop=True)
-        )
-        
-        history['toi_per_game_l10'] = (
-            history.groupby('player_id')['toi_seconds']
-            .rolling(10, min_periods=1).mean()
-            .reset_index(0, drop=True)
-        ) / 60
-        
-        history['toi_per_game_l20'] = (
-            history.groupby('player_id')['toi_seconds']
-            .rolling(20, min_periods=1).mean()
-            .reset_index(0, drop=True)
-        ) / 60
-        
-        history['toi_per_game_season'] = (
-            history.groupby('player_id')['toi_seconds']
-            .expanding(min_periods=1).mean()
-            .reset_index(0, drop=True)
-        ) / 60
-        
-        history['games_played'] = (
-            history.groupby('player_id').cumcount() + 1
-        )
-        
-        # Keep only needed columns
-        return history[[
-            'player_id', 'game_date',
-            'shots_per_game_l10', 'shots_per_game_l20', 'shots_per_game_season',
-            'toi_per_game_l10', 'toi_per_game_l20', 'toi_per_game_season',
-            'games_played'
-        ]]
 
 
     def _add_team_features(self, features: pd.DataFrame) -> pd.DataFrame:

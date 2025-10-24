@@ -195,8 +195,11 @@ def calculate_coverage(predictions: List[Tuple[float, float]],
     upper_percentile = 1 - lower_percentile
     
     covered = 0
+    actuals_array = np.asarray(actuals)
+    if actuals_array.size == 0:
+        return 0.0
     
-    for (mu, alpha), actual in zip(predictions, actuals):
+    for (mu, alpha), actual in zip(predictions, actuals_array):
         p = alpha / (alpha + mu)
         
         # Get percentiles
@@ -206,7 +209,7 @@ def calculate_coverage(predictions: List[Tuple[float, float]],
         if lower <= actual <= upper:
             covered += 1
     
-    return covered / len(actuals) if actuals else 0.0
+    return covered / actuals_array.size
 
 
 def calculate_sharpness(predictions: List[Tuple[float, float]],

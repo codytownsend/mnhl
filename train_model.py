@@ -6,12 +6,15 @@ Usage:
     
 This script:
 1. Collects historical data
-2. Splits into train/val/test
-3. Trains baseline models
-4. Trains main LightGBM model
-5. Calibrates predictions
-6. Evaluates and compares models
-7. Saves artifacts
+2. (Optional) Runs rolling time-series cross-validation diagnostics
+3. Splits into train/val/test
+4. Trains baseline models
+5. Trains main LightGBM model
+6. Calibrates predictive dispersion for intervals
+7. Calibrates probabilities
+8. Fits conformal interval adjustments
+9. Evaluates and compares models
+10. Saves artifacts
 """
 
 import argparse
@@ -30,13 +33,45 @@ from src.data_pipeline.pipeline import (
 from src.data_pipeline.features import FeatureEngineer
 from src.modeling.lgbm_model import LGBMNegativeBinomialModel
 from src.modeling.calibration import create_calibrator, save_calibrator
+from src.modeling.conformal import (
+    ConformalIntervalCalibrator,
+    save_conformal_calibrator
+)
 from src.validation.baselines import create_baseline_models, evaluate_baseline
 from src.validation.metrics import MetricsCalculator
+from sklearn.model_selection import TimeSeriesSplit
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 logger = logging.getLogger(__name__)
+
+
+def build_feature_matrix(feature_engineer: FeatureEngineer, df: pd.DataFrame) -> tuple:
+    """
+    Build model features and targets for the provided dataframe using the
+    supplied feature engineer (which should be fitted on training data).
+    """
+    if df.empty:
+        return pd.DataFrame(), np.array([])
+    
+    tasks = []
+    for _, row in df.iterrows():
+        tasks.append({
+            'player_id': row['player_id'],
+            'player_name': row['player_name'],
+            'position': row['position'],
+            'team_id': row['team_id'],
+            'opponent_team_id': row['opponent_team_id'],
+            'game_id': row['game_id'],
+            'game_date': row['game_date'],
+            'venue_name': row['venue_name'],
+            'is_home': row['home_away'] == 'home',
+        })
+    
+    features = feature_engineer.bulk_build_features(tasks)
+    targets = df['shots'].values
+    return features, targets
 
 
 def collect_historical_data(force_refresh: bool = False) -> pd.DataFrame:
@@ -127,45 +162,89 @@ def prepare_training_data(historical_data: pd.DataFrame) -> tuple:
     # Initialize feature engineer with training data
     feature_engineer = FeatureEngineer(train_df)
     
-    # Build features for each split
-    def prepare_features(df):
-        """Prepare features from raw data."""
-        if df.empty:
-            return pd.DataFrame(), np.array([])
-            
-        # Build prediction tasks
-        tasks = []
-        for _, row in df.iterrows():
-            tasks.append({
-                'player_id': row['player_id'],
-                'player_name': row['player_name'],
-                'position': row['position'],
-                'team_id': row['team_id'],
-                'opponent_team_id': row['opponent_team_id'],
-                'game_id': row['game_id'],
-                'game_date': row['game_date'],
-                'venue_name': row['venue_name'],
-                'is_home': row['home_away'] == 'home',
-            })
-        
-        # Generate features
-        features = feature_engineer.bulk_build_features(tasks)
-        targets = df['shots'].values
-        
-        return features, targets
-    
     logger.info("Building features for train set")
-    X_train, y_train = prepare_features(train_df)
+    X_train, y_train = build_feature_matrix(feature_engineer, train_df)
     
     logger.info("Building features for validation set")
-    X_val, y_val = prepare_features(val_df)
+    X_val, y_val = build_feature_matrix(feature_engineer, val_df)
     
     logger.info("Building features for test set")
-    X_test, y_test = prepare_features(test_df)
+    X_test, y_test = build_feature_matrix(feature_engineer, test_df)
 
     return X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer
 
 
+def run_time_series_cv(historical_data: pd.DataFrame) -> None:
+    """
+    Perform rolling time-series cross-validation to assess model stability.
+    """
+    config = get_config()
+    cv_splits = config.validation.cv_n_splits
+    if cv_splits < 2:
+        logger.info("Skipping time-series CV (cv_n_splits < 2)")
+        return
+    
+    historical_data = historical_data.sort_values('game_date').reset_index(drop=True)
+    n_samples = len(historical_data)
+    if n_samples < cv_splits * 10:
+        logger.info("Skipping time-series CV (insufficient samples)")
+        return
+    
+    unique_dates = historical_data['game_date'].dt.normalize().unique()
+    avg_rows_per_day = max(1, int(np.floor(n_samples / max(1, len(unique_dates)))))
+    
+    test_size = max(
+        1,
+        int(avg_rows_per_day * config.validation.cv_test_size_days)
+    )
+    gap = max(
+        0,
+        int(avg_rows_per_day * config.validation.cv_gap_days)
+    )
+    
+    # Ensure test size is feasible
+    max_test_size = n_samples // (cv_splits + 1)
+    test_size = max(1, min(test_size, max_test_size))
+    gap = min(gap, max(0, n_samples - test_size - 1))
+    
+    splitter = TimeSeriesSplit(
+        n_splits=cv_splits,
+        test_size=test_size,
+        gap=gap
+    )
+    
+    logger.info(
+        f"Running time-series CV (splits={cv_splits}, test_size={test_size}, gap={gap})"
+    )
+    
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(historical_data), start=1):
+        train_df = historical_data.iloc[train_idx].copy()
+        val_df = historical_data.iloc[val_idx].copy()
+        
+        feature_engineer = FeatureEngineer(train_df)
+        X_train, y_train = build_feature_matrix(feature_engineer, train_df)
+        X_val, y_val = build_feature_matrix(feature_engineer, val_df)
+        
+        model = LGBMNegativeBinomialModel()
+        model.fit(X_train, y_train, verbose=False)
+        
+        metrics = model.evaluate(X_val, y_val)
+        fold_metrics.append(metrics)
+        logger.info(
+            f"CV Fold {fold_idx}/{cv_splits} - CRPS: {metrics['crps']:.4f}, "
+            f"MAE: {metrics['mae']:.4f}, RMSE: {metrics['rmse']:.4f}"
+        )
+    
+    if fold_metrics:
+        avg_crps = np.mean([m['crps'] for m in fold_metrics])
+        avg_mae = np.mean([m['mae'] for m in fold_metrics])
+        avg_rmse = np.mean([m['rmse'] for m in fold_metrics])
+        logger.info(
+            f"Time-series CV summary (avg over {len(fold_metrics)} folds): "
+            f"CRPS={avg_crps:.4f}, MAE={avg_mae:.4f}, RMSE={avg_rmse:.4f}"
+        )
 def train_and_evaluate_baselines(X_train, y_train, X_test, y_test, train_df, test_df) -> dict:
     """
     Train and evaluate baseline models.
@@ -241,7 +320,7 @@ def calibrate_model(model, X_val, y_val):
     logger.info("Fitting calibrator")
     
     # Get validation predictions
-    val_predictions = model.predict_distribution(X_val)
+    val_predictions = model.predict_with_uncertainty_adjustment(X_val)
     
     # Create and fit calibrator
     calibrator = create_calibrator()
@@ -259,13 +338,15 @@ def calibrate_model(model, X_val, y_val):
     return calibrator
 
 
-def evaluate_final_model(model, calibrator, X_test, y_test, baseline_results):
+def evaluate_final_model(model, calibrator, interval_calibrator,
+                        X_test, y_test, baseline_results):
     """
     Comprehensive evaluation on test set.
     
     Args:
         model: Trained model
         calibrator: Fitted calibrator
+        interval_calibrator: Conformal interval calibrator
         X_test, y_test: Test data
         baseline_results: Results from baseline models
         
@@ -275,7 +356,7 @@ def evaluate_final_model(model, calibrator, X_test, y_test, baseline_results):
     logger.info("Evaluating final model on test set")
     
     # Get predictions
-    test_predictions = model.predict_distribution(X_test)
+    test_predictions = model.predict_with_uncertainty_adjustment(X_test)
     
     # Calculate metrics
     calculator = MetricsCalculator()
@@ -291,6 +372,17 @@ def evaluate_final_model(model, calibrator, X_test, y_test, baseline_results):
     })
     
     metrics = calculator.evaluate_predictions(predictions_df, actuals_df)
+    
+    if interval_calibrator is not None:
+        interval_df = interval_calibrator.predict(test_predictions)
+        for level in interval_calibrator.confidence_levels:
+            key = int(level * 100)
+            lower = interval_df[f'ci_{key}_lower'].values
+            upper = interval_df[f'ci_{key}_upper'].values
+            coverage = np.mean((y_test >= lower) & (y_test <= upper))
+            sharpness = np.mean(upper - lower)
+            metrics[f'coverage_{key}'] = coverage
+            metrics[f'sharpness_{key}'] = sharpness
     
     logger.info("\n" + "="*60)
     logger.info("FINAL TEST SET RESULTS")
@@ -322,11 +414,15 @@ def evaluate_final_model(model, calibrator, X_test, y_test, baseline_results):
     logger.info(f"  Calibration Error: {metrics['calibration_error']:.4f}")
     
     logger.info("\nCoverage:")
-    for conf_level in [50, 80, 90]:
-        if f'coverage_{conf_level}' in metrics:
-            actual_coverage = metrics[f'coverage_{conf_level}']
-            expected_coverage = conf_level / 100
-            logger.info(f"  {conf_level}% CI: {actual_coverage:.3f} (expected: {expected_coverage:.3f})")
+    coverage_keys = sorted(
+        [k for k in metrics.keys() if k.startswith('coverage_')],
+        key=lambda k: int(k.split('_')[1])
+    )
+    for key in coverage_keys:
+        conf_level = int(key.split('_')[1])
+        actual_coverage = metrics[key]
+        expected_coverage = conf_level / 100
+        logger.info(f"  {conf_level}% CI: {actual_coverage:.3f} (expected: {expected_coverage:.3f})")
     
     logger.info("="*60 + "\n")
     
@@ -343,13 +439,14 @@ def evaluate_final_model(model, calibrator, X_test, y_test, baseline_results):
     return metrics
 
 
-def save_model_artifacts(model, calibrator, feature_engineer):
+def save_model_artifacts(model, calibrator, interval_calibrator, feature_engineer):
     """
     Save all model artifacts.
     
     Args:
         model: Trained model
         calibrator: Fitted calibrator
+        interval_calibrator: Conformal interval calibrator
         feature_engineer: Feature engineer (for metadata)
     """
     config = get_config()
@@ -365,6 +462,9 @@ def save_model_artifacts(model, calibrator, feature_engineer):
     
     # Save calibrator
     save_calibrator(calibrator, output_dir / "calibrator.pkl")
+    
+    # Save interval calibrator
+    save_conformal_calibrator(interval_calibrator, output_dir / "interval_calibrator.pkl")
     
     # Save feature importance
     importance = model.get_feature_importance('mu', top_n=50)
@@ -397,6 +497,11 @@ def main():
     action='store_true',
     help='Save test features and targets for diagnostics'
     )
+    parser.add_argument(
+        '--run-cv',
+        action='store_true',
+        help='Run time-series cross-validation diagnostics before training'
+    )
     
     args = parser.parse_args()
     
@@ -410,11 +515,14 @@ def main():
     logger.info("="*60)
     
     # Step 1: Collect historical data
-    logger.info("\n[1/7] Collecting historical data")
+    logger.info("\n[1/10] Collecting historical data")
     historical_data = collect_historical_data(force_refresh=args.refresh_data)
     
+    if args.run_cv:
+        run_time_series_cv(historical_data)
+    
     # Step 2: Prepare training data
-    logger.info("\n[2/7] Preparing training data")
+    logger.info("\n[2/10] Preparing training data")
     X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer = prepare_training_data(
         historical_data
     )
@@ -446,26 +554,39 @@ def main():
     # Step 3: Train and evaluate baselines
     baseline_results = {}
     if not args.skip_baselines:
-        logger.info("\n[3/7] Training baseline models")
+        logger.info("\n[3/10] Training baseline models")
         baseline_results = train_and_evaluate_baselines(X_train, y_train, X_test, y_test, train_df, test_df)
     else:
-        logger.info("\n[3/7] Skipping baseline training")
+        logger.info("\n[3/10] Skipping baseline training")
     
     # Step 4: Train main model
-    logger.info("\n[4/7] Training main model")
+    logger.info("\n[4/10] Training main model")
     model = train_main_model(X_train, y_train, X_val, y_val)
     
-    # Step 5: Calibrate
-    logger.info("\n[5/7] Calibrating predictions")
+    # Step 5: Dispersion calibration for intervals
+    logger.info("\n[5/10] Calibrating dispersion")
+    model.calibrate_dispersion(X_val, y_val)
+    
+    # Step 6: Probability calibration
+    logger.info("\n[6/10] Calibrating predictions")
     calibrator = calibrate_model(model, X_val, y_val)
     
-    # Step 6: Evaluate
-    logger.info("\n[6/7] Evaluating on test set")
-    final_metrics = evaluate_final_model(model, calibrator, X_test, y_test, baseline_results)
+    # Step 7: Conformal interval calibration
+    logger.info("\n[7/10] Fitting conformal interval calibrator")
+    val_dist = model.predict_with_uncertainty_adjustment(X_val)
+    interval_calibrator = ConformalIntervalCalibrator(config.validation.confidence_levels)
+    interval_calibrator.fit(val_dist, y_val)
+    logger.info(f"Conformal adjustments: {interval_calibrator.get_metadata()}")
     
-    # Step 7: Save artifacts
-    logger.info("\n[7/7] Saving model artifacts")
-    save_model_artifacts(model, calibrator, feature_engineer)
+    # Step 8: Evaluate
+    logger.info("\n[8/10] Evaluating on test set")
+    final_metrics = evaluate_final_model(model, calibrator, interval_calibrator, X_test, y_test, baseline_results)
+    
+    # Step 9: Save artifacts
+    logger.info("\n[9/10] Saving model artifacts")
+    save_model_artifacts(model, calibrator, interval_calibrator, feature_engineer)
+    
+    logger.info("\n[10/10] Training workflow complete")
     
     logger.info("\n" + "="*60)
     logger.info("TRAINING COMPLETE")
